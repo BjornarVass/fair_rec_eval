@@ -9,8 +9,10 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import roc_auc_score
 from sklearn.linear_model import LogisticRegression
 
-from item2vec import fit_item2vec, fit_item2vec2
-from utils import ndcg_at_k, item_wise_ratio, item_ratio_diff
+from item2vec import fit_item2vec
+from utils import ndcg_at_k, item_wise_ratio, item_ratio_diff, kendall_tau_rec
+from optin.train import parse_arguments
+from optin.data_processing import load_and_uncompress
 
 
 class LinearClassifier(nn.Module):
@@ -117,10 +119,10 @@ class SeqClassifier(nn.Module):
 
 
 class SeqDataset(Dataset):
-    def __init__(self, seqs, s, dropout=False, ratios=None):
+    def __init__(self, seqs, s, dropout=False, ratios=None, device="cuda"):
         self.dropout = dropout
         self.seqs = seqs.detach()
-        self.s = torch.tensor(s, dtype=torch.float32)
+        self.s = torch.tensor(s, dtype=torch.float32, device=device)
         self.n = self.seqs.shape[0]
         self.ratios = ratios
 
@@ -159,49 +161,73 @@ def main():
     eval_classify(dataset_path)
 
 
-def eval_classify(dataset_path, dataset_filename):
+def eval_classify(
+    dataset_path,
+    dataset_filename,
+    budget=50,
+    info_lambd=5.0,
+    info_adv=10,
+    embeddings=None,
+    synth=True,
+    s_ind=0,
+    double_adv=False,
+):
     device = "cuda"
-    torch.set_default_device(device)
-    min_count = 5
-    window_size = 2
+    # torch.set_default_device(device)
     top_k = 40
-    embed_top_k = 20
-    emb_tr_batch = 64
+    small_k = 10
     embedding_dim = 8
-    dim2 = 128
-    emb_n_epochs = 25
-    store = True
 
-    cat_ratio = False
+    cat_ratio = True
     new_embed = False
-    load = False
-    all_models = False
-    models = ["POP ", "RAND"]
+    all_trained_models = False
+    perturb = budget > -1
+    info_align = info_lambd > -1
+    train_rec = perturb or info_align
+    models = ["POP ", "RAND", "UNFAIR", "UNFAIR_DIV"]
+    if train_rec:
+        models = models + ["BASE"]
+        if perturb:
+            models = models + ["PERTURB"]
+        if info_align:
+            models = models + ["INFO"]
 
     tr_batch = 1024
     n_head = 2 + cat_ratio
     n_es = 5
-    n_tests = 10
+    n_tests = 1
     verbose = False
     log_reg = False
     dropout = False
-    s_ind = 0
+    if synth:
+        data = np.load(dataset_path + dataset_filename)
+        # data = np.load("metrics_afrl.npz")
+        # data = np.load("metrics_perturb2adv.npz")
+        tr_x = data["tr_x"]
+        tr_s = data["tr_s"]
 
-    data = np.load(dataset_path + dataset_filename)
-    # data = np.load("metrics_afrl.npz")
-    # data = np.load("metrics_perturb2adv.npz")
-    tr_x = data["tr_x"]
-    tr_s = data["tr_s"]
+        va_x = data["va_x"]
+        va_s = data["va_s"]
+        va_y = data["va_y"]
 
-    va_x = data["va_x"]
-    va_s = data["va_s"]
-    va_y = data["va_y"]
+        te_x = data["te_x"]
+        te_s = data["te_s"]
+        te_y = data["te_y"]
+    else:
+        (
+            tr_x,
+            va_x,
+            va_y,
+            te_x,
+            te_y,
+            _,
+            tr_s,
+            va_s,
+            te_s,
+            _,
+        ) = load_and_uncompress(dataset_path, user_split=True)
 
-    te_x = data["te_x"]
-    te_s = data["te_s"]
-    te_y = data["te_y"]
-
-    if all_models:
+    if all_trained_models:
         models = ["VAE ", "FAIR"] + models
         tr_p = data["tr_p"]
         tr_p2 = data["tr_p2"]
@@ -209,42 +235,26 @@ def eval_classify(dataset_path, dataset_filename):
         va_p2 = data["va_p2"]
         te_p = data["te_p"]
         te_p2 = data["te_p2"]
-
+    elif train_rec:
+        if perturb:
+            tr_ba, va_ba, te_ba, tr_perturb, va_perturb, te_perturb, auc_base, auc_perturb = train_models(
+                dataset_path, perturb=True, budget=budget, synth=synth
+            )
+        if info_align:
+            tr_ba, va_ba, te_ba, tr_info, va_info, te_info, auc_base, auc_info = train_models(
+                dataset_path,
+                info_align=True,
+                lambd=info_lambd,
+                n_adv_train=info_adv,
+                synth=synth,
+                double_adv=double_adv,
+            )
     demographics = tr_s.mean(0)
 
     if new_embed:
         reindex_map = {i: i for i in range(tr_x.shape[1])}
-    elif not load:
-        # embeddings, reindex_map = fit_item2vec(
-        #     tr_x,
-        #     tr_p,
-        #     va_p,
-        #     min_count,
-        #     window_size,
-        #     embed_top_k,
-        #     emb_tr_batch,
-        #     embedding_dim,
-        #     dim2,
-        #     emb_n_epochs,
-        #     device,
-        #     store=store,
-        # )
-        embeddings, reindex_map = fit_item2vec2(
-            tr_x,
-            min_count,
-            emb_tr_batch,
-            embedding_dim,
-            dim2,
-            device,
-            dataset_path,
-            verbose,
-            store=store,
-        )
-    else:
-        with open(dataset_path + "reindex_map.pkl", "rb") as f:
-            reindex_map = pickle.load(f)
-        embeddings = nn.Embedding(len(reindex_map), embedding_dim)
-        embeddings.load_state_dict(torch.load("embs.pt", weights_only=True))
+    elif embeddings is not None:
+        embeddings, reindex_map = embeddings
 
     base_item_ratios = tr_x[tr_s[:, s_ind] == 1].sum(0) / tr_x.sum(0)
     item_ratios = None
@@ -253,7 +263,7 @@ def eval_classify(dataset_path, dataset_filename):
         for k, v in reindex_map.items():
             ratio = base_item_ratios[k]
             item_ratios[v] = ratio
-        item_ratios = torch.tensor(item_ratios)
+        item_ratios = torch.tensor(item_ratios, device=device)
 
     vocab_size = None
     if new_embed:
@@ -261,6 +271,10 @@ def eval_classify(dataset_path, dataset_filename):
     tr_pop, tr_rand = fair_baseline_scores(tr_x)
     va_pop, va_rand = fair_baseline_scores(va_x, train_pop=tr_x.sum(0))
     te_pop, te_rand = fair_baseline_scores(te_x, train_pop=tr_x.sum(0))
+
+    tr_unfair, tr_divisive = unfair_baseline_scores(tr_x, tr_s[:, s_ind])
+    va_unfair, va_divisive = unfair_baseline_scores(va_x, va_s[:, s_ind])
+    te_unfair, te_divisive = unfair_baseline_scores(te_x, te_s[:, s_ind])
 
     results = {}
 
@@ -281,6 +295,26 @@ def eval_classify(dataset_path, dataset_filename):
             tr_scores = tr_rand
             va_scores = va_rand
             te_scores = te_rand
+        elif mode == "UNFAIR":
+            tr_scores = tr_unfair
+            va_scores = va_unfair
+            te_scores = te_unfair
+        elif mode == "UNFAIR_DIV":
+            tr_scores = tr_divisive
+            va_scores = va_divisive
+            te_scores = te_divisive
+        elif mode == "BASE":
+            tr_scores = tr_ba
+            va_scores = va_ba
+            te_scores = te_ba
+        elif mode == "PERTURB":
+            tr_scores = tr_perturb
+            va_scores = va_perturb
+            te_scores = te_perturb
+        elif mode == "INFO":
+            tr_scores = tr_info
+            va_scores = va_info
+            te_scores = te_info
         else:
             continue
 
@@ -310,29 +344,28 @@ def eval_classify(dataset_path, dataset_filename):
             SeqDataset(tr_sq_x, tr_s[:, s_ind : s_ind + 1], dropout=dropout, ratios=tr_ratios),
             batch_size=tr_batch,
             shuffle=True,
-            generator=torch.Generator(device=device),
         )
         va_loader = DataLoader(
             SeqDataset(va_sq_x, va_s[:, s_ind : s_ind + 1], ratios=va_ratios),
             batch_size=va_scores.shape[0],
-            generator=torch.Generator(device=device),
         )
         te_loader = DataLoader(
             SeqDataset(te_sq_x, te_s[:, s_ind : s_ind + 1], ratios=te_ratios),
             batch_size=te_scores.shape[0],
-            generator=torch.Generator(device=device),
         )
         aucs = []
         for test_nr in range(n_tests):
             # model = SeqClassifier(embedding_dim, n_head, top_k, vocab_size=vocab_size, cat_ratio=cat_ratio)
-            model = LinearClassifier(embedding_dim, top_k, vocab_size=vocab_size, cat_ratio=cat_ratio)
-            # model = RNNClassifier(embedding_dim, top_k, vocab_size=vocab_size, cat_ratio=cat_ratio)
+            # model = LinearClassifier(embedding_dim, top_k, vocab_size=vocab_size, cat_ratio=cat_ratio)
+            model = RNNClassifier(embedding_dim, top_k, vocab_size=vocab_size, cat_ratio=cat_ratio)
+            model.to(device)
             optimizer = optim.Adam(model.parameters())
             loss_function = nn.BCELoss()
             best_loss = np.inf
             improv_counter = 0
             best_model = None
             epoch = 0
+            eps = 1e-4
             while epoch < 1000:
                 model.train()
                 losses = []
@@ -361,9 +394,14 @@ def eval_classify(dataset_path, dataset_filename):
                     print(f"{epoch} Train: {np.mean(losses):.4f}, Val: {mean_loss:.4f}, AUC: {np.mean(auc)}")
                 # Early stopping
                 if mean_loss < best_loss:
-                    best_loss = mean_loss
-                    improv_counter = 0
                     best_model = copy.deepcopy(model.state_dict())
+                    if best_loss - mean_loss > eps:
+                        improv_counter = 0
+                    else:
+                        improv_counter += 1
+                        if improv_counter == n_es:
+                            break
+                    best_loss = mean_loss
                 else:
                     improv_counter += 1
                     if improv_counter == n_es:
@@ -390,6 +428,12 @@ def eval_classify(dataset_path, dataset_filename):
         rat_auc_mean, rat_auc_med = ratio_auc(te_scores, s_np, top_k, base_item_ratios)
         met_item_ratios, item_counts = item_wise_ratio(te_scores, te_s, top_k)
         ratio_mean, ratio_std = item_ratio_diff(met_item_ratios, demographics, item_counts, lower_count=5)
+        kendall_tau = kendall_tau_rec(te_x, s_np[:, 0], top_k, 2 * top_k, te_scores)
+
+        rat_auc_mean2, rat_auc_med2 = ratio_auc(te_scores, s_np, small_k, base_item_ratios)
+        met_item_ratios2, item_counts2 = item_wise_ratio(te_scores, te_s, small_k)
+        ratio_mean2, ratio_std2 = item_ratio_diff(met_item_ratios2, demographics, item_counts2, lower_count=5)
+        kendall_tau2 = kendall_tau_rec(te_x, s_np[:, 0], small_k, 2 * small_k, te_scores)
         # print(
         #     f"MODEL: {mode}, AUC: {np.mean(aucs):.4f} std: {np.std(aucs):.4f} R_Mean_AUC: {rat_auc_mean:.4f} R_Med_AUC: {rat_auc_med:.4f} NDCG: {np.mean(ndcg_at_k(te_scores, te_y)):.4f} Item ratio: {ratio_mean[s_ind]:.4f}"
         # )
@@ -400,12 +444,75 @@ def eval_classify(dataset_path, dataset_filename):
             "R_Med_AUC": rat_auc_med,
             "NDCG": np.mean(ndcg_at_k(te_scores, te_y)),
             "Item_ratio": ratio_mean[s_ind],
+            "Kendall-Tau": kendall_tau,
+            f"R_Mean_AUC{small_k}": rat_auc_mean2,
+            f"R_Med_AUC{small_k}": rat_auc_med2,
+            f"Item_ratio{small_k}": ratio_mean2[s_ind],
+            f"Kendall-Tau{small_k}": kendall_tau2,
         }
+        if mode == "BASE":
+            model_results["Rep AUC"] = auc_base
+        elif mode == "PERTURB":
+            model_results["Rep AUC"] = auc_perturb
+        elif mode == "INFO":
+            model_results["Rep AUC"] = auc_info
         results[mode] = model_results
     return results
 
 
-def get_seq_data(probs, top_k, reindex_map, tensor=True):
+def train_models(
+    datapath, perturb=False, info_align=False, budget=50, lambd=5.0, n_adv_train=10, synth=True, double_adv=False
+):
+    args = [
+        "--beta",
+        "0.2",
+        "--processed_dir",
+        datapath,
+        "--tr_batch_size",
+        "805",
+        "--te_batch_size",
+        "1610",
+        "--adv",
+        "--early_stopping",
+        "25",
+    ]
+    if synth:
+        args += ["--load_synth"]
+    if perturb:
+        args += [
+            "--perturb",
+            "--dropout_adv",
+            "0.5",
+            "--hidden_dim_adv",
+            "32",
+            "--max_budget",
+            str(budget),
+        ]
+        if double_adv:
+            args += ["--double_adv"]
+    elif info_align:
+        args += [
+            "--info_align",
+            "--hidden_dim_adv",
+            "64",
+            "--n_adv_pre",
+            "0",
+            "--lambd",
+            str(lambd),
+            "--n_adv_train",
+            str(n_adv_train),
+        ]
+    base_probs, fair_probs, base_auc, fair_auc = parse_arguments(args)
+    tr_p = base_probs[0]
+    va_p = base_probs[1]
+    te_p = base_probs[2]
+    tr_q = fair_probs[0]
+    va_q = fair_probs[1]
+    te_q = fair_probs[2]
+    return tr_p, va_p, te_p, tr_q, va_q, te_q, base_auc, fair_auc
+
+
+def get_seq_data(probs, top_k, reindex_map, tensor=True, device="cuda"):
     n_users = probs.shape[0]
     n_items = probs.shape[1]
     valid_recs = np.zeros((n_users, top_k), dtype=np.int64)
@@ -420,8 +527,8 @@ def get_seq_data(probs, top_k, reindex_map, tensor=True):
                 if next_ind == top_k:
                     break
 
-    if tensor == True:
-        valid_recs = torch.tensor(valid_recs)
+    if tensor:
+        valid_recs = torch.tensor(valid_recs, device=device)
     return valid_recs
 
 
@@ -450,6 +557,33 @@ def fair_baseline_scores(x, train_pop=None):
     random_scores = np.argsort(-np.random.rand(*x.shape), axis=1).astype(np.float32)
     random_scores[x.nonzero()] = -np.inf
     return pop_scores, random_scores
+
+
+def unfair_baseline_scores(x, s):
+    s_pop = np.zeros_like(x)
+    s_divisive = np.zeros_like(x)
+    pop0 = x[s == 0]
+    pop1 = x[s == 1]
+    n0 = pop0.shape[0]
+    n1 = pop1.shape[0]
+    sum0 = pop0.sum(0)
+    sum1 = pop1.sum(0)
+    s_pop[s == 0] = sum0
+    s_pop[s == 1] = sum1
+    s_pop[x.nonzero()] = -np.inf
+
+    tot_count = x.sum(0)
+    ratio0 = sum0 / n0
+    ratio1 = sum1 / n1
+    ratio_score0 = ratio0 - ratio1
+    ratio_score1 = ratio1 - ratio0
+    ratio_score0[np.logical_or(ratio_score0 < 0, tot_count < 5)] = 0
+    ratio_score1[np.logical_or(ratio_score1 < 0, tot_count < 5)] = 0
+    s_divisive[s == 0] = ratio_score0
+    s_divisive[s == 1] = ratio_score1
+    s_divisive[x.nonzero()] = -np.inf
+
+    return s_pop, s_divisive
 
 
 def ratio_auc(probs, s, top_k, ratios):
