@@ -1,3 +1,12 @@
+#### NOTE This code is borrowed from: https://arxiv.org/abs/2407.16594 and based on an earlier version of their
+#    code (timed-out anonymized repository in the v1 arxiv pre-print). An updated public repository for
+#    the KDD publication is found at: https://github.com/SimoneMungari/HYDRA?tab=readme-ov-file
+#
+#    We have made some minor (non-functional) changes to the code to improve its runtime, dump data in a
+#    format we prefer and supress printing. These changes are highlighted by preceeding "# ADDED CODE:"
+#    or "# CHANGED CODE:" comments. The comments further detail what is added/changed.
+
+
 import os
 import numpy as np
 from os.path import exists
@@ -11,7 +20,7 @@ import argparse
 import json
 import sys
 
-RNG_ALTERNATIVE = False
+# ADDED CODE: settings for faster sampling. VERBOSE flag is used to suppress prints of original code
 FASTER_RNG = True
 VERBOSE = False
 
@@ -240,7 +249,9 @@ def gen_dataset(params, dataset_path, relevance_sorting=0):
 
     num_populations = len(ETA_users)
 
-    num_users_populations = [int(num_users * ETA_users[i]) for i in range(len(ETA_users))]
+    # CHANGED CODE: int() replaced with round() for handling precision issue
+    num_users_populations = [round(num_users * ETA_users[i]) for i in range(len(ETA_users))]
+    # num_users_populations = [int(num_users * ETA_users[i]) for i in range(len(ETA_users))]
 
     users_populations_mapping = {}
     users = np.array(list(range(num_users)))
@@ -339,19 +350,17 @@ def gen_dataset(params, dataset_path, relevance_sorting=0):
 
     V_df = pd.DataFrame(V)
 
+    # CHANGED CODE: interleaved changes for faster sampling.
     def generate_history(user, p, min_len, g_pop, num_ones=0):
         items = []
         iteration = 0
         while len(items) < num_ones:
-            if RNG_ALTERNATIVE or FASTER_RNG:
+            if FASTER_RNG:
                 rng_2 = np.random.default_rng(user + iteration)
-                if FASTER_RNG:
-                    check_val = rng_2.uniform()
+                check_val = rng_2.uniform()
             for item, p_i in enumerate(p):
                 add = False
-                if RNG_ALTERNATIVE:
-                    add = rng_2.binomial(1, (p_i ** g_pop[item]))
-                elif FASTER_RNG:
+                if FASTER_RNG:
                     add = check_val <= p_i ** g_pop[item]
                 else:
                     rng_2 = np.random.default_rng(user + iteration)
@@ -367,9 +376,7 @@ def gen_dataset(params, dataset_path, relevance_sorting=0):
                 while len(items) < min_len:
                     for item, p_i in enumerate(p):
                         add = False
-                        if RNG_ALTERNATIVE:
-                            add = rng_2.binomial(1, (p_i ** g_pop[item]))
-                        elif FASTER_RNG:
+                        if FASTER_RNG:
                             add = check_val <= p_i ** g_pop[item]
                         else:
                             rng_2 = np.random.default_rng(user + iteration)
@@ -391,8 +398,6 @@ def gen_dataset(params, dataset_path, relevance_sorting=0):
                 break
 
         if len(items) > num_ones:
-            if not RNG_ALTERNATIVE:
-                rng_2 = np.random.default_rng(user + iteration)
             indices = rng_2.choice(np.arange(len(items)), size=int(num_ones), replace=False)
             items = np.array(items)[indices]
 
@@ -474,7 +479,7 @@ def gen_dataset(params, dataset_path, relevance_sorting=0):
     # for user, p in enumerate(P):
     #    histories.append(generate_history(user, p, MIN_LEN, g_pop, num_ones[user]))
 
-    # OWN CODE!!!!
+    # ADDED CODE: added call for dumping data to specific format
     dump_matrices(dataset_path, histories, num_users, num_items, num_users_populations)
 
     interactions = []
@@ -536,9 +541,10 @@ def gen_dataset(params, dataset_path, relevance_sorting=0):
         print("Finished")
 
 
+# ADDED CODE: function for dumping dataset
 def dump_matrices(dataset_path, histories, num_users, num_items, num_users_populations, min_occ=5, min_items=5):
     start = 0
-    s = np.zeros((num_users, 2))
+    s = np.zeros((num_users, 1))
     tr_inds = np.array([], dtype=int)
     va_inds = np.array([], dtype=int)
     te_inds = np.array([], dtype=int)
